@@ -229,16 +229,17 @@ class SimpleVectorStore:
         # Sort by similarity score (descending) and return top k
         results.sort(key=lambda x: x[1], reverse=True)
         return results[:k]
-
+    
     def search_lexical(self,
                        query_text: str,
                        k: int = 5,
                        filters: Optional[FilterType] = None) -> List[Tuple[ItemId, float]]:
         """
-        Performs simple case-insensitive substring lexical search.
+        Performs simple case-insensitive KEYWORD lexical search.
+        Checks if ANY word from the query exists in the item's text.
 
         Args:
-            query_text: The text string to search for.
+            query_text: The text string to search for keywords from.
             k: Max number of results to return (ranking is arbitrary here).
             filters: Optional metadata filters to apply before searching.
 
@@ -250,20 +251,31 @@ class SimpleVectorStore:
         if not candidate_ids:
             return []
 
-        query_lower = query_text.lower()
+        # Split query into words and lowercase them.
+        # Basic split, ignores punctuation attached to words for simplicity.
+        # Consider using regex or a library like nltk for better tokenization if needed.
+        query_words = set(word for word in query_text.lower().split() if word) # Use a set for faster lookup
+
+        if not query_words: # Handle empty query
+             return []
+
         results = []
         for item_id in candidate_ids:
-            # Check if text exists and is a string before lowercasing
             item_text = self.data[item_id].get("text", "")
             if isinstance(item_text, str):
                 item_text_lower = item_text.lower()
-                if query_lower in item_text_lower:
-                    # Simple match score - could be improved (e.g., TF-IDF)
-                    results.append((item_id, 1.0))
-            else:
-                 # Handle cases where text might be missing or not a string
-                 print(f"Warning: Item {item_id} has non-string or missing text field.")
+                # Check if any query word is present in the item text
+                # This is still basic substring checking for each word
+                found_match = False
+                for word in query_words:
+                    if word in item_text_lower:
+                        found_match = True
+                        break # Found one word, no need to check others for a simple 1.0 score
 
+                if found_match:
+                    results.append((item_id, 1.0)) # Simple 1.0 score on any match
+            else:
+                 print(f"Warning: Item {item_id} has non-string or missing text field.")
 
         # No meaningful ranking here, just return up to k matches
         return results[:k]
