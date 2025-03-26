@@ -1,8 +1,10 @@
 import numpy as np
 from typing import List, Dict, Any, Optional, Tuple, Callable
-import uuid # For generating IDs if not provided
-import json # For saving and loading
-import os   # For file path operations
+import uuid
+import json
+import os
+from collections import defaultdict # Needed for hybrid search normalization
+from simple_lexical_search import SimpleSearchEngine
 
 # Define a type alias for clarity
 ItemId = str
@@ -13,21 +15,23 @@ FilterType = Dict[str, Any]
 class SimpleVectorStore:
     """
     A simple in-memory store for vectors, text, and metadata,
-    supporting vector similarity, lexical search, filtering, updates,
+    supporting vector similarity, TF-IDF lexical search, filtering, updates,
     and saving/loading to JSON.
     """
 
-    def __init__(self, vector_dim: Optional[int] = None):
+    def __init__(self, vector_dim: Optional[int] = None, stopwords: Optional[set] = None):
         """
         Initializes the store.
 
         Args:
             vector_dim: Expected dimension for all vectors. If provided,
                         vectors added must match this dimension.
+            stopwords: Optional set of stopwords for the lexical search engine.
         """
         self.data: Dict[ItemId, ItemData] = {}
         self.vector_dim: Optional[int] = vector_dim
-        # Don't print during basic init, print happens after loading or first add
+        # Initialize the lexical search engine
+        self.lexical_engine = SimpleSearchEngine(stopwords=stopwords)
         # print(f"Initialized SimpleVectorStore (Expected vector dim: {vector_dim or 'Any'})")
 
     # ----- Core Data Management -----
@@ -38,12 +42,14 @@ class SimpleVectorStore:
                  metadata: Metadata,
                  item_id: Optional[ItemId] = None) -> ItemId:
         """Adds or overwrites an item in the store."""
+        is_update = False
         if item_id is None:
             item_id = str(uuid.uuid4())
         elif item_id in self.data:
             print(f"Warning: Overwriting existing item with ID: {item_id}")
+            is_update = True # Treat overwrite as an update for indexing
 
-        # Validate vector dimension if specified
+        # ... (Keep vector dimension validation as is) ...
         current_vector_dim = vector.shape[0] if isinstance(vector, np.ndarray) else None
         if current_vector_dim is None:
              raise ValueError("Input vector must be a numpy array.")
@@ -54,23 +60,26 @@ class SimpleVectorStore:
              self.vector_dim = current_vector_dim
              print(f"Inferred vector dimension from first item: {self.vector_dim}")
         elif self.vector_dim is None and self.data: # Check against inferred dim
-             # This case should ideally not happen if the first item set it,
-             # but adding a check for robustness if store was somehow manipulated
              first_item_vec = next(iter(self.data.values()))["vector"]
              inferred_dim = first_item_vec.shape[0]
              if current_vector_dim != inferred_dim:
                  raise ValueError(f"Vector dimension mismatch. Expected {inferred_dim} (inferred), got {current_vector_dim}")
              self.vector_dim = inferred_dim # Solidify inferred dim
         elif self.vector_dim is not None and current_vector_dim != self.vector_dim:
-             # This check is redundant with the first one but kept for clarity
             raise ValueError(f"Vector dimension mismatch. Expected {self.vector_dim}, got {current_vector_dim}")
 
 
+        # Store data first
         self.data[item_id] = {
-            "vector": vector.astype(np.float32), # Store as consistent type
+            "vector": vector.astype(np.float32),
             "text": text,
-            "metadata": metadata.copy() # Store a copy
+            "metadata": metadata.copy()
         }
+
+        # Index/Re-index in lexical engine
+        # Note: SimpleSearchEngine's index_document now handles removal if ID exists
+        self.lexical_engine.index_document(item_id, text)
+
         return item_id
 
     def get_item(self, item_id: ItemId) -> Optional[ItemData]:
@@ -81,11 +90,17 @@ class SimpleVectorStore:
         """Deletes an item by its ID. Returns True if deleted, False otherwise."""
         if item_id in self.data:
             del self.data[item_id]
+            # Also remove from the lexical index
+            self.lexical_engine.remove_document(item_id)
+            # If store becomes empty, reset inferred dimension? Optional.
+            # if not self.data:
+            #     self.vector_dim = None # Or keep the last known dimension? Decide based on desired behavior.
             return True
         return False
 
     def update_vector(self, item_id: ItemId, vector: np.ndarray) -> bool:
         """Updates the vector for a specific item."""
+        # ... (Keep update_vector logic as is) ...
         if item_id in self.data:
             current_vector_dim = vector.shape[0] if isinstance(vector, np.ndarray) else None
             if current_vector_dim is None:
@@ -100,11 +115,14 @@ class SimpleVectorStore:
         """Updates the text for a specific item."""
         if item_id in self.data:
             self.data[item_id]["text"] = text
+            # Re-index the document in the lexical engine
+            self.lexical_engine.index_document(item_id, text)
             return True
         return False
 
     def update_metadata(self, item_id: ItemId, metadata_update: Metadata, replace: bool = False) -> bool:
         """Updates the metadata for a specific item. Merges by default."""
+        # ... (Keep update_metadata logic as is - no impact on lexical index) ...
         if item_id in self.data:
             if replace:
                 self.data[item_id]["metadata"] = metadata_update.copy()
@@ -113,50 +131,41 @@ class SimpleVectorStore:
             return True
         return False
 
+
     # ----- Filtering -----
 
     def _matches_filters(self, item_metadata: Metadata, filters: FilterType) -> bool:
-        """Checks if item metadata matches the provided filters."""
+        # ... (Keep _matches_filters logic as is) ...
         if not filters:
             return True
         for key, value in filters.items():
-            # Handle special filter conditions first
             try:
                 if key.endswith('__gt'):
                     actual_key = key[:-4]
-                    if not (actual_key in item_metadata and isinstance(item_metadata[actual_key], (int, float)) and item_metadata[actual_key] > value):
-                        return False
+                    if not (actual_key in item_metadata and isinstance(item_metadata[actual_key], (int, float)) and item_metadata[actual_key] > value): return False
                 elif key.endswith('__lt'):
                     actual_key = key[:-4]
-                    if not (actual_key in item_metadata and isinstance(item_metadata[actual_key], (int, float)) and item_metadata[actual_key] < value):
-                        return False
+                    if not (actual_key in item_metadata and isinstance(item_metadata[actual_key], (int, float)) and item_metadata[actual_key] < value): return False
                 elif key.endswith('__gte'):
                     actual_key = key[:-5]
-                    if not (actual_key in item_metadata and isinstance(item_metadata[actual_key], (int, float)) and item_metadata[actual_key] >= value):
-                        return False
+                    if not (actual_key in item_metadata and isinstance(item_metadata[actual_key], (int, float)) and item_metadata[actual_key] >= value): return False
                 elif key.endswith('__lte'):
                     actual_key = key[:-5]
-                    if not (actual_key in item_metadata and isinstance(item_metadata[actual_key], (int, float)) and item_metadata[actual_key] <= value):
-                        return False
+                    if not (actual_key in item_metadata and isinstance(item_metadata[actual_key], (int, float)) and item_metadata[actual_key] <= value): return False
                 elif key.endswith('__in'):
                      actual_key = key[:-4]
-                     if not (actual_key in item_metadata and isinstance(value, (list, tuple, set)) and item_metadata[actual_key] in value):
-                         return False
-                elif key.endswith('__contains'): # Check if metadata value (list/str) contains filter value
+                     if not (actual_key in item_metadata and isinstance(value, (list, tuple, set)) and item_metadata[actual_key] in value): return False
+                elif key.endswith('__contains'):
                      actual_key = key[:-10]
-                     if not (actual_key in item_metadata and hasattr(item_metadata[actual_key], '__contains__') and value in item_metadata[actual_key]):
-                         return False
-                # Default: Basic equality check
+                     if not (actual_key in item_metadata and hasattr(item_metadata[actual_key], '__contains__') and value in item_metadata[actual_key]): return False
                 else:
-                    if key not in item_metadata or item_metadata[key] != value:
-                       return False
-            except (TypeError, KeyError): # Handle cases where comparisons or key access fail gracefully
-                 return False
+                    if key not in item_metadata or item_metadata[key] != value: return False
+            except (TypeError, KeyError): return False
         return True
 
 
     def _get_filtered_ids(self, filters: Optional[FilterType]) -> List[ItemId]:
-        """Returns a list of item IDs that match the filters."""
+        # ... (Keep _get_filtered_ids logic as is) ...
         if not filters:
             return list(self.data.keys())
         return [
@@ -167,20 +176,15 @@ class SimpleVectorStore:
     # ----- Search Methods -----
 
     def _cosine_similarity(self, vec1: np.ndarray, vec2: np.ndarray) -> float:
-        """Calculates cosine similarity between two vectors."""
-        # Ensure vectors are float32 for consistency
+        # ... (Keep _cosine_similarity logic as is) ...
         vec1 = vec1.astype(np.float32)
         vec2 = vec2.astype(np.float32)
-
         if vec1.shape != vec2.shape:
              raise ValueError(f"Cannot compute similarity for vectors with shapes {vec1.shape} and {vec2.shape}")
         norm1 = np.linalg.norm(vec1)
         norm2 = np.linalg.norm(vec2)
-        if norm1 == 0 or norm2 == 0:
-            return 0.0
-        # Use np.dot for potentially better performance and clarity
+        if norm1 == 0 or norm2 == 0: return 0.0
         similarity = np.dot(vec1, vec2) / (norm1 * norm2)
-        # Clip to handle potential floating point inaccuracies slightly outside [-1, 1]
         return float(np.clip(similarity, -1.0, 1.0))
 
 
@@ -188,37 +192,18 @@ class SimpleVectorStore:
                       query_vector: np.ndarray,
                       k: int = 5,
                       filters: Optional[FilterType] = None) -> List[Tuple[ItemId, float]]:
-        """
-        Performs vector similarity search (cosine similarity).
-
-        Args:
-            query_vector: The vector to search for.
-            k: Number of nearest neighbors to return.
-            filters: Optional metadata filters to apply before searching.
-
-        Returns:
-            A list of tuples: (item_id, similarity_score), sorted by score descending.
-        """
-        query_vector = query_vector.astype(np.float32) # Ensure query is float32
+        # ... (Keep search_vector logic as is) ...
+        query_vector = query_vector.astype(np.float32)
         query_dim = query_vector.shape[0]
-        if self.vector_dim is not None and query_dim != self.vector_dim:
-             raise ValueError(f"Query vector dimension mismatch. Expected {self.vector_dim}, got {query_dim}")
+        if self.vector_dim is not None and query_dim != self.vector_dim: raise ValueError(f"Query vector dimension mismatch. Expected {self.vector_dim}, got {query_dim}")
         elif self.vector_dim is None and self.data:
-             # Infer expected dim from existing data if not set
              first_item_vec = next(iter(self.data.values()))["vector"]
              inferred_dim = first_item_vec.shape[0]
-             if query_dim != inferred_dim:
-                  raise ValueError(f"Query vector dimension mismatch. Expected {inferred_dim} (inferred), got {query_dim}")
-             # Optionally set self.vector_dim here if desired, or leave as None
-             # self.vector_dim = inferred_dim
-        elif self.vector_dim is None and not self.data:
-             # Cannot search an empty store, and cannot verify dimension
-             return []
-
+             if query_dim != inferred_dim: raise ValueError(f"Query vector dimension mismatch. Expected {inferred_dim} (inferred), got {query_dim}")
+        elif self.vector_dim is None and not self.data: return []
 
         candidate_ids = self._get_filtered_ids(filters)
-        if not candidate_ids:
-            return []
+        if not candidate_ids: return []
 
         results = []
         for item_id in candidate_ids:
@@ -226,80 +211,66 @@ class SimpleVectorStore:
             similarity = self._cosine_similarity(query_vector, item_vector)
             results.append((item_id, similarity))
 
-        # Sort by similarity score (descending) and return top k
         results.sort(key=lambda x: x[1], reverse=True)
         return results[:k]
-    
+
     def search_lexical(self,
                        query_text: str,
                        k: int = 5,
                        filters: Optional[FilterType] = None) -> List[Tuple[ItemId, float]]:
         """
-        Performs simple case-insensitive KEYWORD lexical search.
-        Checks if ANY word from the query exists in the item's text.
+        Performs lexical search using the integrated TF-IDF based SimpleSearchEngine.
 
         Args:
-            query_text: The text string to search for keywords from.
-            k: Max number of results to return (ranking is arbitrary here).
-            filters: Optional metadata filters to apply before searching.
+            query_text: The text string to search for.
+            k: Max number of results to return.
+            filters: Optional metadata filters to apply *after* retrieving search results.
 
         Returns:
-            A list of tuples: (item_id, score) - score is 1.0 for match, 0.0 otherwise.
-            Limited by k, but not meaningfully ranked beyond matching/not matching.
+            A list of tuples: (item_id, tf_idf_score), sorted by score descending.
         """
         candidate_ids = self._get_filtered_ids(filters)
         if not candidate_ids:
             return []
+        candidate_id_set = set(candidate_ids) # For faster lookup
 
-        # Split query into words and lowercase them.
-        # Basic split, ignores punctuation attached to words for simplicity.
-        # Consider using regex or a library like nltk for better tokenization if needed.
-        query_words = set(word for word in query_text.lower().split() if word) # Use a set for faster lookup
+        # Perform search using the lexical engine - search across all indexed docs
+        # Request more than k initially, as filtering happens afterwards.
+        # Requesting all possible results ensures we don't miss candidates due to TF-IDF rank.
+        all_lexical_results = self.lexical_engine.search(query_text, top_n=len(self.data))
 
-        if not query_words: # Handle empty query
-             return []
+        # Filter results based on the metadata filters
+        filtered_results = [
+            (item_id, score) for item_id, score in all_lexical_results
+            if item_id in candidate_id_set
+        ]
 
-        results = []
-        for item_id in candidate_ids:
-            item_text = self.data[item_id].get("text", "")
-            if isinstance(item_text, str):
-                item_text_lower = item_text.lower()
-                # Check if any query word is present in the item text
-                # This is still basic substring checking for each word
-                found_match = False
-                for word in query_words:
-                    if word in item_text_lower:
-                        found_match = True
-                        break # Found one word, no need to check others for a simple 1.0 score
+        # Return the top k of the filtered results
+        # Sorting is already done by the search engine, but filtering might change order slightly if scores were identical.
+        # Re-sorting ensures consistency, though often redundant.
+        filtered_results.sort(key=lambda x: x[1], reverse=True)
+        return filtered_results[:k]
 
-                if found_match:
-                    results.append((item_id, 1.0)) # Simple 1.0 score on any match
-            else:
-                 print(f"Warning: Item {item_id} has non-string or missing text field.")
-
-        # No meaningful ranking here, just return up to k matches
-        return results[:k]
 
     def search_hybrid(self,
                       query_vector: np.ndarray,
                       query_text: str,
                       k: int = 5,
                       filters: Optional[FilterType] = None,
-                      vector_weight: float = 0.7,
-                      lexical_scorer: Optional[Callable[[str, str], float]] = None
+                      vector_weight: float = 0.5,
+                      # lexical_scorer removed - we now use TF-IDF internally
                       ) -> List[Tuple[ItemId, float]]:
         """
-        Performs a hybrid search combining vector similarity and lexical relevance.
+        Performs a hybrid search combining vector similarity and TF-IDF lexical relevance.
+        Scores are combined after normalizing both to a 0-1 range within the candidate set.
 
         Args:
             query_vector: The vector part of the query.
             query_text: The text part of the query.
             k: Number of results to return.
             filters: Optional metadata filters.
-            vector_weight: Weight given to vector similarity score (0.0 to 1.0).
-                           Lexical score weight will be (1.0 - vector_weight).
-            lexical_scorer: Optional function (query_text, item_text) -> score (0-1).
-                            Defaults to basic substring match score (1 if match, 0 else).
+            vector_weight: Weight given to normalized vector similarity score (0.0 to 1.0).
+                           Normalized lexical score weight will be (1.0 - vector_weight).
 
         Returns:
             A list of tuples: (item_id, combined_score), sorted by score descending.
@@ -307,83 +278,107 @@ class SimpleVectorStore:
         if not (0.0 <= vector_weight <= 1.0):
             raise ValueError("vector_weight must be between 0.0 and 1.0")
 
-        query_vector = query_vector.astype(np.float32) # Ensure query is float32
+        # --- Vector Dimension Checks (same as search_vector) ---
+        query_vector = query_vector.astype(np.float32)
         query_dim = query_vector.shape[0]
-        if self.vector_dim is not None and query_dim != self.vector_dim:
-             raise ValueError(f"Query vector dimension mismatch. Expected {self.vector_dim}, got {query_dim}")
+        if self.vector_dim is not None and query_dim != self.vector_dim: raise ValueError(f"Query vector dimension mismatch. Expected {self.vector_dim}, got {query_dim}")
         elif self.vector_dim is None and self.data:
              first_item_vec = next(iter(self.data.values()))["vector"]
              inferred_dim = first_item_vec.shape[0]
-             if query_dim != inferred_dim:
-                  raise ValueError(f"Query vector dimension mismatch. Expected {inferred_dim} (inferred), got {query_dim}")
-        elif self.vector_dim is None and not self.data:
-             return [] # Cannot search empty store
-
+             if query_dim != inferred_dim: raise ValueError(f"Query vector dimension mismatch. Expected {inferred_dim} (inferred), got {query_dim}")
+        elif self.vector_dim is None and not self.data: return []
+        # --- End Vector Dimension Checks ---
 
         candidate_ids = self._get_filtered_ids(filters)
         if not candidate_ids:
             return []
 
-        # Default lexical scorer: simple substring match
-        if lexical_scorer is None:
-            query_lower = query_text.lower()
-            def default_scorer(q_text, i_text):
-                 # Handle non-string item text gracefully
-                 if isinstance(i_text, str):
-                    return 1.0 if query_lower in i_text.lower() else 0.0
-                 return 0.0
-            lexical_scorer = default_scorer
-
-        results = []
+        vector_scores = {}
+        lexical_scores = {}
+        combined_results = []
         lexical_weight = 1.0 - vector_weight
+
+        # --- Calculate Scores for Candidates ---
+        min_vec_score, max_vec_score = float('inf'), float('-inf')
+        min_lex_score, max_lex_score = float('inf'), float('-inf')
+
+        # Preprocess query once for lexical scoring
+        processed_query_terms = self.lexical_engine._preprocess(query_text)
 
         for item_id in candidate_ids:
             item_data = self.data[item_id]
-            vector_score = self._cosine_similarity(query_vector, item_data["vector"])
-            lexical_score = lexical_scorer(query_text, item_data.get("text", "")) # Use .get for safety
 
-            # Normalize vector score (cosine is -1 to 1, map to 0 to 1)
-            normalized_vector_score = (vector_score + 1.0) / 2.0
+            # 1. Vector Score
+            vec_score = self._cosine_similarity(query_vector, item_data["vector"])
+            vector_scores[item_id] = vec_score
+            min_vec_score = min(min_vec_score, vec_score)
+            max_vec_score = max(max_vec_score, vec_score)
 
-            combined_score = (vector_weight * normalized_vector_score) + (lexical_weight * lexical_score)
-            results.append((item_id, combined_score))
+            # 2. Lexical Score (TF-IDF)
+            # Use the helper method from SimpleSearchEngine if available
+            if hasattr(self.lexical_engine, '_get_tf_idf_score'):
+                 lex_score = self.lexical_engine._get_tf_idf_score(processed_query_terms, item_id)
+            else: # Fallback if method not added or import failed
+                 lex_score = 0.0 # Or implement basic scoring here as fallback
+            lexical_scores[item_id] = lex_score
+            min_lex_score = min(min_lex_score, lex_score)
+            max_lex_score = max(max_lex_score, lex_score)
+
+
+        # --- Normalize and Combine Scores ---
+        vec_range = max_vec_score - min_vec_score
+        lex_range = max_lex_score - min_lex_score
+
+        for item_id in candidate_ids:
+            # Normalize vector score (cosine similarity -1 to 1 -> 0 to 1)
+            # Note: Original code normalized (score + 1)/2. Let's stick to that.
+            norm_vec_score = (vector_scores[item_id] + 1.0) / 2.0
+
+            # Normalize lexical score (TF-IDF 0 to N -> 0 to 1 based on range in candidates)
+            if lex_range > 0:
+                norm_lex_score = (lexical_scores[item_id] - min_lex_score) / lex_range
+            elif max_lex_score > 0: # All candidates have the same non-zero score
+                norm_lex_score = 1.0
+            else: # All candidates have zero score
+                norm_lex_score = 0.0
+
+            combined_score = (vector_weight * norm_vec_score) + (lexical_weight * norm_lex_score)
+            combined_results.append((item_id, combined_score))
 
         # Sort by combined score (descending) and return top k
-        results.sort(key=lambda x: x[1], reverse=True)
-        return results[:k]
+        combined_results.sort(key=lambda x: x[1], reverse=True)
+        return combined_results[:k]
+
 
     # ----- Persistence -----
 
     def save(self, filename_base: str):
         """
-        Saves the current state of the vector store to a JSON file.
+        Saves the current state of the vector store (vectors, text, metadata)
+        to a JSON file. The lexical index is NOT saved and will be rebuilt on load.
 
         Args:
             filename_base: The base name for the file (e.g., "my_store").
                            ".json" will be appended automatically.
         """
         filepath = filename_base + ".json"
-        print(f"Saving vector store to {filepath}...")
-
-        # Prepare data for JSON serialization
+        print(f"Saving vector store data to {filepath}...")
+        # ... (Keep serialization logic as is) ...
         serializable_data = {}
         for item_id, item_data in self.data.items():
             serializable_data[item_id] = {
-                # Convert numpy array to list
                 "vector": item_data["vector"].tolist(),
                 "text": item_data["text"],
                 "metadata": item_data["metadata"]
             }
-
         save_package = {
             "vector_dim": self.vector_dim,
             "data": serializable_data
         }
-
         try:
             with open(filepath, 'w', encoding='utf-8') as f:
-                json.dump(save_package, f, indent=4) # Use indent for readability
-            print(f"Successfully saved {len(self.data)} items.")
+                json.dump(save_package, f, indent=4)
+            print(f"Successfully saved {len(self.data)} items. Lexical index will be rebuilt on load.")
         except IOError as e:
             print(f"Error saving store to {filepath}: {e}")
         except TypeError as e:
@@ -391,91 +386,76 @@ class SimpleVectorStore:
 
 
     @classmethod
-    def load(cls, filename_base: str) -> 'SimpleVectorStore':
+    def load(cls, filename_base: str, stopwords: Optional[set] = None) -> 'SimpleVectorStore':
         """
-        Loads a vector store from a JSON file.
+        Loads a vector store from a JSON file and rebuilds the lexical index.
 
         Args:
             filename_base: The base name of the file to load (e.g., "my_store").
                            ".json" will be appended automatically.
+            stopwords: Optional set of stopwords for the lexical search engine.
 
         Returns:
             A new SimpleVectorStore instance populated with the loaded data.
 
         Raises:
-            FileNotFoundError: If the specified file does not exist.
-            ValueError: If the file format is invalid or data is inconsistent.
+            FileNotFoundError, ValueError, IOError as before.
         """
         filepath = filename_base + ".json"
-        print(f"Loading vector store from {filepath}...")
-
-        if not os.path.exists(filepath):
-             raise FileNotFoundError(f"Save file not found: {filepath}")
-
+        print(f"Loading vector store data from {filepath}...")
+        # ... (Keep file reading and basic validation as is) ...
+        if not os.path.exists(filepath): raise FileNotFoundError(f"Save file not found: {filepath}")
         try:
-            with open(filepath, 'r', encoding='utf-8') as f:
-                load_package = json.load(f)
-        except json.JSONDecodeError as e:
-            raise ValueError(f"Error decoding JSON from {filepath}: {e}")
-        except IOError as e:
-            raise IOError(f"Error reading file {filepath}: {e}")
-
-
-        # Validate basic structure
-        if "vector_dim" not in load_package or "data" not in load_package:
-            raise ValueError(f"Invalid file format in {filepath}. Missing 'vector_dim' or 'data' key.")
+            with open(filepath, 'r', encoding='utf-8') as f: load_package = json.load(f)
+        except json.JSONDecodeError as e: raise ValueError(f"Error decoding JSON from {filepath}: {e}")
+        except IOError as e: raise IOError(f"Error reading file {filepath}: {e}")
+        if "vector_dim" not in load_package or "data" not in load_package: raise ValueError(f"Invalid file format in {filepath}. Missing 'vector_dim' or 'data' key.")
 
         loaded_vector_dim = load_package["vector_dim"]
         loaded_data = load_package["data"]
 
-        # Create a new store instance with the loaded dimension
-        store = cls(vector_dim=loaded_vector_dim)
+        # Create a new store instance with the loaded dimension AND stopwords
+        store = cls(vector_dim=loaded_vector_dim, stopwords=stopwords)
 
-        # Populate the store
+        print("Populating store and rebuilding lexical index...")
+        items_processed = 0
+        # Populate the store's data dictionary first
         for item_id, item_data in loaded_data.items():
+             # ... (Keep item data validation and numpy conversion as is) ...
             if not all(k in item_data for k in ["vector", "text", "metadata"]):
                  print(f"Warning: Skipping item {item_id} due to missing keys (vector, text, or metadata).")
                  continue
-
             try:
-                # Convert vector list back to numpy array
                 vector_list = item_data["vector"]
                 vector = np.array(vector_list, dtype=np.float32)
 
-                # Validate dimension consistency within the loaded data
-                if loaded_vector_dim is not None and vector.shape[0] != loaded_vector_dim:
-                     raise ValueError(
-                         f"Inconsistent vector dimension for item {item_id} in {filepath}. "
-                         f"Expected {loaded_vector_dim}, found {vector.shape[0]}."
-                     )
-                elif loaded_vector_dim is None and store.data: # If dim wasn't set initially, check against first loaded
+                # Validate dimension consistency
+                if store.vector_dim is not None and vector.shape[0] != store.vector_dim:
+                     raise ValueError(f"Inconsistent vector dimension for item {item_id}. Expected {store.vector_dim}, found {vector.shape[0]}.")
+                elif store.vector_dim is None and store.data: # If dim wasn't set initially, check against first loaded
                      first_vec_dim = next(iter(store.data.values()))["vector"].shape[0]
-                     if vector.shape[0] != first_vec_dim:
-                          raise ValueError(
-                              f"Inconsistent vector dimension for item {item_id} in {filepath}. "
-                              f"Expected {first_vec_dim} (inferred from first loaded item), found {vector.shape[0]}."
-                          )
+                     if vector.shape[0] != first_vec_dim: raise ValueError(f"Inconsistent vector dimension for item {item_id}. Expected {first_vec_dim} (inferred), found {vector.shape[0]}.")
                      store.vector_dim = first_vec_dim # Set the inferred dim now
-                elif loaded_vector_dim is None and not store.data: # First item being loaded when dim was None
+                elif store.vector_dim is None and not store.data: # First item being loaded when dim was None
                      store.vector_dim = vector.shape[0] # Infer and set dim from this item
                      print(f"Inferred vector dimension from loaded file's first item: {store.vector_dim}")
 
-
                 # Add directly to the internal data dictionary
-                # (Bypasses add_item checks which are partially redundant here)
                 store.data[item_id] = {
                     "vector": vector,
                     "text": item_data["text"],
                     "metadata": item_data["metadata"]
                 }
+                items_processed += 1
             except (ValueError, TypeError) as e:
-                # Catch errors during numpy array conversion or validation
                 raise ValueError(f"Error processing item {item_id} from {filepath}: {e}")
 
+        # Now, rebuild the lexical index from the loaded data
+        for item_id, item_data in store.data.items():
+            store.lexical_engine.index_document(item_id, item_data['text'])
 
-        print(f"Successfully loaded {len(store.data)} items. Vector dimension: {store.vector_dim or 'Inferred/Any'}")
+        print(f"Successfully loaded {len(store.data)} items. Vector dimension: {store.vector_dim or 'Inferred/Any'}. Lexical index rebuilt.")
         return store
-
 
     # ----- Utility -----
 
@@ -487,28 +467,25 @@ class SimpleVectorStore:
         """Returns a list of all item IDs."""
         return list(self.data.keys())
 
-# --- Example Usage ---
+# --- Example Usage (Updated) ---
 if __name__ == "__main__":
     # Initialize store, optionally specifying vector dimension
-    store = SimpleVectorStore(vector_dim=3)
+    store = SimpleVectorStore(vector_dim=3) # Can also pass stopwords=set([...])
 
     # Add items
-    id1 = store.add_item(np.array([0.1, 0.2, 0.7]), "This is the first document about cats.", {"category": "pets", "year": 2023, "tags": ["feline"]})
-    id2 = store.add_item(np.array([0.8, 0.1, 0.1]), "A second document, this one concerns dogs.", {"category": "pets", "year": 2022})
-    id3 = store.add_item(np.array([0.5, 0.5, 0.0]), "Talking about birds and maybe dogs too.", {"category": "pets", "year": 2023, "rating": 4.5})
-    id4 = store.add_item(np.array([0.2, 0.7, 0.1]), "A document unrelated to pets, about programming.", {"category": "tech", "year": 2023, "tags": ["code", "python"]})
+    id1 = store.add_item(np.array([0.1, 0.2, 0.7]), "The quick brown fox jumps over the lazy dog.", {"category": "pets", "year": 2023, "tags": ["feline", "jump"]})
+    id2 = store.add_item(np.array([0.8, 0.1, 0.1]), "A second document, this one concerns dogs and foxes.", {"category": "pets", "year": 2022})
+    id3 = store.add_item(np.array([0.5, 0.5, 0.0]), "Talking about birds and maybe lazy dogs too.", {"category": "pets", "year": 2023, "rating": 4.5})
+    id4 = store.add_item(np.array([0.2, 0.7, 0.1]), "A document unrelated to pets, about python programming and code.", {"category": "tech", "year": 2023, "tags": ["code", "python"]})
 
     print(f"\nStore contains {len(store)} items.")
-    # print(f"Item IDs: {store.list_ids()}") # ID listing can be long
 
     # --- Updates ---
     print("\n--- Updates ---")
-    store.update_text(id1, "This is the first document, updated to be about fluffy cats.")
-    store.update_metadata(id2, {"tags": ["canine", "friendly"]}, replace=False) # Merge
-    store.update_vector(id4, np.array([0.1, 0.8, 0.1]))
-    print("Updated item 1 text, item 2 metadata, item 4 vector.")
-    # print(f"Item 1 data: {store.get_item(id1)}")
-    # print(f"Item 2 data: {store.get_item(id2)}")
+    store.update_text(id1, "This first document is updated, still about fluffy cats and quick foxes.") # Re-indexes this doc
+    store.update_metadata(id2, {"tags": ["canine", "friendly"]}, replace=False) # No re-index needed
+    store.update_vector(id4, np.array([0.1, 0.8, 0.1])) # No re-index needed
+    print("Updated item 1 text (re-indexed), item 2 metadata, item 4 vector.")
 
     # --- Vector Search ---
     print("\n--- Vector Search (Query: close to dogs/item2) ---")
@@ -521,55 +498,64 @@ if __name__ == "__main__":
     vector_results_filtered = store.search_vector(query_vec, k=3, filters={"year": 2023})
     print(f"Top {len(vector_results_filtered)} filtered vector results: {vector_results_filtered}")
 
-    # --- More Complex Filter ---
-    print("\n--- Vector Search (Query: close to dogs/item2, Filter: year>=2023, category='pets') ---")
-    vector_results_filtered_adv = store.search_vector(query_vec, k=3, filters={"year__gte": 2023, "category": "pets"})
-    print(f"Top {len(vector_results_filtered_adv)} filtered vector results: {vector_results_filtered_adv}")
+    # --- Lexical Search (Now TF-IDF) ---
+    print("\n--- Lexical Search (Query: 'lazy dogs') ---")
+    lexical_results = store.search_lexical("lazy dogs", k=3)
+    print(f"Found {len(lexical_results)} lexical results (TF-IDF): {lexical_results}")
+    # Display text for context
+    for res_id, score in lexical_results:
+        item = store.get_item(res_id)
+        print(f"  - {res_id} (Score: {score:.4f}): {item['text'][:60]}...")
 
-    print("\n--- Lexical Search (Query: 'document', Filter: tags contains 'python') ---")
-    lexical_results_filtered_adv = store.search_lexical("document", k=3, filters={"tags__contains": "python"})
-    print(f"Found {len(lexical_results_filtered_adv)} filtered lexical results: {lexical_results_filtered_adv}")
-
-
-    # --- Lexical Search ---
-    print("\n--- Lexical Search (Query: 'dogs') ---")
-    lexical_results = store.search_lexical("dogs", k=3)
-    print(f"Found {len(lexical_results)} lexical results: {lexical_results}")
 
     # --- Lexical Search with Filter ---
-    print("\n--- Lexical Search (Query: 'document', Filter: category='pets') ---")
-    lexical_results_filtered = store.search_lexical("document", k=3, filters={"category": "pets"})
-    print(f"Found {len(lexical_results_filtered)} filtered lexical results: {lexical_results_filtered}")
+    print("\n--- Lexical Search (Query: 'document python', Filter: category='tech') ---")
+    lexical_results_filtered = store.search_lexical("document python", k=3, filters={"category": "tech"})
+    print(f"Found {len(lexical_results_filtered)} filtered lexical results (TF-IDF): {lexical_results_filtered}")
+    for res_id, score in lexical_results_filtered:
+        item = store.get_item(res_id)
+        print(f"  - {res_id} (Score: {score:.4f}): {item['text'][:60]}...")
 
-    # --- Hybrid Search ---
-    print("\n--- Hybrid Search (Query Vec: like dogs, Query Text: 'cats', weight=0.5) ---")
-    hybrid_results = store.search_hybrid(query_vec, "cats", k=3, vector_weight=0.5)
+
+    # --- Hybrid Search (Now uses normalized TF-IDF) ---
+    print("\n--- Hybrid Search (Query Vec: like dogs, Query Text: 'quick fox', weight=0.5) ---")
+    hybrid_results = store.search_hybrid(query_vec, "quick fox", k=3, vector_weight=0.5)
     print(f"Top {len(hybrid_results)} hybrid results: {hybrid_results}")
+    for res_id, score in hybrid_results:
+        item = store.get_item(res_id)
+        vec_s = store._cosine_similarity(query_vec, item['vector'])
+        lex_s = store.lexical_engine._get_tf_idf_score(store.lexical_engine._preprocess("quick fox"), res_id)
+        print(f"  - {res_id} (Combined: {score:.4f}) (Vec ~ {(vec_s+1)/2:.3f}, Lex ~ {lex_s:.3f}): {item['text'][:60]}...")
+
 
      # --- Hybrid Search with Filter ---
     print("\n--- Hybrid Search (Query Vec: like dogs, Query Text: 'document', Filter: year=2023, weight=0.8) ---")
     hybrid_results_filtered = store.search_hybrid(query_vec, "document", k=3, filters={"year": 2023}, vector_weight=0.8)
     print(f"Top {len(hybrid_results_filtered)} filtered hybrid results: {hybrid_results_filtered}")
+    for res_id, score in hybrid_results_filtered:
+        item = store.get_item(res_id)
+        print(f"  - {res_id} (Combined: {score:.4f}): {item['text'][:60]}...")
+
 
     # --- Deletion ---
     print("\n--- Deletion ---")
-    deleted = store.delete_item(id4)
+    deleted = store.delete_item(id4) # This should now remove from lexical index too
     print(f"Deleted item {id4}: {deleted}")
     print(f"Store now contains {len(store)} items.")
-    # print(f"Item 4 data: {store.get_item(id4)}") # Should be None
+
+    # Verify lexical search no longer finds deleted item's content easily
+    print("\n--- Lexical Search After Deletion (Query: 'python code') ---")
+    lexical_after_delete = store.search_lexical("python code", k=3)
+    print(f"Found {len(lexical_after_delete)} lexical results: {lexical_after_delete}") # Should be empty or not include id4
 
     # --- Persistence ---
     print("\n--- Persistence ---")
-    SAVE_FILENAME = "my_simple_vector_store"
+    SAVE_FILENAME = "my_integrated_vector_store"
     store.save(SAVE_FILENAME)
-
-    # Clear the store (or just create a new variable) to test loading
-    # store.data = {} # Optional: Clear in-memory data
-    # store.vector_dim = None # Optional: Clear dimension
-    # print("\nCleared in-memory store.")
 
     # Load from file into a new instance
     try:
+        print("\n--- Loading Store ---")
         loaded_store = SimpleVectorStore.load(SAVE_FILENAME)
         print(f"\nLoaded store contains {len(loaded_store)} items.")
         print(f"Vector dimension of loaded store: {loaded_store.vector_dim}")
@@ -578,23 +564,24 @@ if __name__ == "__main__":
         loaded_item1 = loaded_store.get_item(id1)
         if loaded_item1:
             print(f"Successfully retrieved item {id1} from loaded store.")
-            # print(f"Loaded Item 1 Text: {loaded_item1['text']}")
-            # print(f"Loaded Item 1 Vector (type): {type(loaded_item1['vector'])}") # Should be numpy.ndarray
-            # print(f"Loaded Item 1 Vector Dim: {loaded_item1['vector'].shape}")
         else:
             print(f"Error: Failed to retrieve item {id1} from loaded store.")
 
-        # Perform a search on the loaded store
-        print("\n--- Vector Search on Loaded Store (Query: close to dogs/item2) ---")
-        loaded_vector_results = loaded_store.search_vector(query_vec, k=3)
-        print(f"Top {len(loaded_vector_results)} vector results: {loaded_vector_results}")
+        # Perform searches on the loaded store to ensure index was rebuilt
+        print("\n--- Lexical Search on Loaded Store (Query: 'lazy dogs') ---")
+        loaded_lexical_results = loaded_store.search_lexical("lazy dogs", k=3)
+        print(f"Found {len(loaded_lexical_results)} lexical results (TF-IDF): {loaded_lexical_results}")
+
+        print("\n--- Hybrid Search on Loaded Store (Query Vec: like dogs, Query Text: 'quick fox', weight=0.5) ---")
+        loaded_hybrid_results = loaded_store.search_hybrid(query_vec, "quick fox", k=3, vector_weight=0.5)
+        print(f"Top {len(loaded_hybrid_results)} hybrid results: {loaded_hybrid_results}")
 
         # Clean up the created file (optional)
-        # try:
-        #     os.remove(SAVE_FILENAME + ".json")
-        #     print(f"\nCleaned up {SAVE_FILENAME}.json")
-        # except OSError as e:
-        #     print(f"Error removing file {SAVE_FILENAME}.json: {e}")
+        try:
+            os.remove(SAVE_FILENAME + ".json")
+            print(f"\nCleaned up {SAVE_FILENAME}.json")
+        except OSError as e:
+            print(f"Error removing file {SAVE_FILENAME}.json: {e}")
 
-    except (FileNotFoundError, ValueError, IOError) as e:
+    except (FileNotFoundError, ValueError, IOError, NameError) as e: # Added NameError for dummy class case
         print(f"\nError during load test: {e}")
