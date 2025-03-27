@@ -22,13 +22,11 @@ A lightweight, in-memory Python library for managing and searching items contain
 
 ## Installation
 
-Currently, `SimpleVectorStore` is provided as a single Python class. To use it:
-
-1. Copy the `simple_vector_store.py` file (containing the `SimpleVectorStore` class definition) into your project directory.
-2. Import the class into your script:
+```
+pip install simple-vector-store
+```
 
 ```python
-# Assuming simple_vector_store.py is in the same directory or your PYTHONPATH
 from simple_vector_store import SimpleVectorStore
 import numpy as np
 ```
