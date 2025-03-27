@@ -234,7 +234,7 @@ print(f"Error loading store: {e}")
 ## Limitations
 
 * **In-Memory Only:** The entire dataset must fit into available RAM. Not suitable for very large datasets.
-* **Basic Search Performance:** Vector search involves a linear scan. It will become slow with a very large number of items. No approximate nearest neighbor (ANN) indexing is implemented. Lexical search is also basic.
+* **Basic Search Performance:** Vector search involves a linear scan. It will become slow with a very large number of items. No approximate nearest neighbor (ANN) indexing is implemented. Lexical search is ~~also basic~~ kinda awesome now.
 * **Scalability:** Primarily designed for single-process use. Concurrent writes are not inherently thread-safe without external locking mechanisms.
 * **JSON Serialization:** Metadata must contain JSON-serializable types for persistence to work correctly.
 
